@@ -1,0 +1,961 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[3]:
+
+
+import pyodbc
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.table import Table, TableStyleInfo
+import pandas as pd
+pd.options.mode.chained_assignment = None
+import numpy as np
+from datetime import datetime
+import os
+
+
+begin_time = datetime.now()
+[4, 2, 3, 1, 5].sort()
+print(datetime.now())
+
+
+##File check for PrimaryKey input file
+try:
+    f = open(r'\\???.xlsx')
+    f.close()
+    ref_int_file = 0
+except FileNotFoundError:
+    print('Primary Key File does not exist')
+    ref_int_file = 1
+
+##File check for Ref Integrity input file
+try:
+    f = open(r'\\source.xlsx')
+    f.close()
+    prim_key_file = 0
+except FileNotFoundError:
+    print('Referential Integrity File does not exist')
+    prim_key_file = 1
+
+    
+## Pass the batch id 
+conn_batch = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=???;'## UDM server = ????
+    'Database=????;'
+    'Trusted_Connection=yes'
+)
+
+batch_id_query = """SELECT TOP 1 BATCH_ID FROM ??????? ORDER BY BATCH_DATE_TIME DESC, BATCH_ID DESC"""
+batch_id = pd.read_sql_query(batch_id_query, conn_batch)
+batch_id = batch_id.iloc[0][0]
+batch_id = str(batch_id)
+
+
+  
+class DatabaseInterface(object):
+    
+    def __init__(self,server,database,workbook_path):
+        self.server = server
+        self.database = database
+        self.driver = '{ODBC Driver 17 for SQL Server}'
+        #self.username = username
+        #self.password = password
+        #self.schema = schema
+        self.workbook_path = workbook_path
+        self.main_sheet = 'Main'
+        self.analytics_sheet = 'General_Analytics'
+        self.outlier_sheet = 'Outlier_Analytics'
+        self.details_sheet = 'Connection_Details'
+        self.processed_sheet = 'Processed_Tables'
+        self.connection = pyodbc.connect(
+                        'DRIVER={ODBC Driver 17 for SQL Server};'
+                        'SERVER=' + self.server + ';'
+                        'DATABASE=' + self.database + ';'
+                        'Trusted_Connection=yes')
+        self.cursor = self.connection.cursor()
+        self.final_table = ['TABLE_NAME','COLUMN_NAME','DATA_TYPE','UNIQUE_COLUMN','TABLE_COUNT','NULL_COUNT',
+                            'PERCENTAGE_NULL','BLANK_COUNT','PERCENTAGE_BLANK','MIN_DATE','MAX_DATE','FUTURE_DATE_COUNT',
+                            'PERCENTAGE_FUTURE_DATE','ABNORMAL_DATE_COUNT','YRS_25','PERCENT_GTR_25','YRS_50','PERCENT_GTR_50',
+                            'YRS_75', 'PERCENT_GTR_75','YRS_100','PERCENT_GTR_100','YRS_150','PERCENT_GTR_150','NEGATIVE_COUNT',
+                            'PERCENTAGE_NEGATIVE','ZERO_COUNT','PERCENTAGE_ZERO','MAX_LENGTH','ACTUAL_MAX_LENGTH','COUNT_TRAILING',
+                            'PERCENT_TRAILING','COUNT_LEADING','PERCENT_LEADING', 'MEAN_VALUE', 'MODE_VALUE', 'MAX_VALUE', 'MIN_VALUE', 'HASH_SUM']
+        self.outlier_table = ['TABLE_NAME','COLUMN_NAME','DATA_TYPE','DF_DATE','DF_COUNT','DF_PERCENT','MF_MONTH',
+                              'MF_YEAR','MF_COUNT','MF_PERCENT','YF_YEAR','YF_COUNT','YF_PERCENT','AVL_VALUE',
+                              'AVL_ZSCORE','AFL_VALUE','AFL_COUNT','AFL_PERCENT','STRUCTURE','COUNT_STRUCTURE']
+    ##-------------------Core_Functions------------------------##
+    
+    def execute(self,query,data_frame = True):
+        self.cursor.execute(query)
+        results = self.cursor.fetchall()
+        if not data_frame:
+            return results
+        else:
+            return pd.read_sql_query(query,self.connection)
+    
+    #Test Function (disregard)
+    def full_process(self):
+        self.create_excel()
+        gen_tab = self.write_from_gen()
+        out_tab = self.write_from_out()
+        return gen_tab, out_tab
+
+    ##
+    ## Change the values for table_catalog and table_schema below for the databse and schema needed
+    ##
+    def get_table_attributes(self, inorder = True,):
+        query = """  
+        SELECT
+            [TABLE] AS [TABLE_NAME]
+            ,[COLUMN] AS [COLUMN_NAME]
+            ,[DATA_TYPE]
+            ,[CDE] AS [INCLUDE]
+        FROM [????].[???\????].[INDIVIDUAL_THRESHOLDS_V1]
+        WHERE [DATABASE] = 'CTR - UDM STG'
+        AND [DATA_TYPE] <> ''
+                    """
+#                     AND table_schema in ('dbo') 
+#                     AND table_name NOT LIKE 'V_%'"""
+        if inorder:
+            return self.execute(query + "ORDER BY TABLE_NAME")
+        else:
+            return self.execute(query)
+    
+    def colnum_string(self, cols, rows):
+        string = ""
+        while cols > 0:
+            cols, remainder = divmod(cols - 1, 26)
+            string = chr(65 + remainder) + string
+        return "A1:" + string + str(rows + 1)
+    
+    def create_details_sheet(self):
+        data = pd.DataFrame.from_dict({'DATABASE' : [self.database]})
+        data.index.name = "_"
+        with pd.ExcelWriter(self.workbook_path, engine = 'openpyxl') as writer:
+            writer.book = load_workbook(self.workbook_path)
+            data.to_excel(writer, self.details_sheet)
+        writer.save()
+        return data
+        #Export Server, Database, Scheme
+    
+    def create_processed_sheet(self):
+        data = self.get_tables_processed()
+        with pd.ExcelWriter(self.workbook_path, engine = 'openpyxl') as writer:
+            writer.book = load_workbook(self.workbook_path)
+            data.to_excel(writer, self.processed_sheet)
+        writer.save()
+        wb = load_workbook(self.workbook_path)
+        #sheet = wb.get_sheet_by_name(self.main_sheet)
+        sheet = wb[self.processed_sheet]
+        tab = Table(displayName = "Processed_Table", ref = self.colnum_string(data.shape[1] + 1, data.shape[0]))
+        style = TableStyleInfo(name = "TableStyleMedium9", showRowStripes = True, showColumnStripes = False)
+        tab.tableStyleInfo = style
+        sheet.add_table(tab)
+        wb.save(self.workbook_path)
+    
+    def get_tables_processed(self):
+        data_y = self.fetch_main()
+        data_n = pd.read_excel(self.workbook_path,self.main_sheet)
+        data_n = data_n[data_n.INCLUDE == "N"]
+        data_n = data_n.TABLE_NAME.unique()
+        data_y = data_y.TABLE_NAME.unique()
+        data_y = pd.DataFrame(data_y, columns = ["TABLE_NAME"])
+        data_n = pd.DataFrame(data_n, columns = ["TABLE_NAME"])
+        data_y["PROCESSED"] = "Y"
+        data_n["PROCESSED"] = "N"
+        data = pd.concat([data_y,data_n], axis = 0, sort = False)
+        data = data.groupby(["TABLE_NAME"]).agg(lambda col: ','.join(col))
+        for index, row in data.iterrows():
+            if len(row["PROCESSED"]) > 1:
+                row["PROCESSED"] = "Y"
+        data.index.name = "INDEX"
+        return data
+        
+    
+    def create_excel(self):
+        db = self.get_table_attributes()
+        db['INCLUDE'] = "Y"
+        db['PRIORITY'] = ""
+        db.index.name = "INDEX"
+        writer = pd.ExcelWriter(self.workbook_path, engine = 'openpyxl')
+        db.to_excel(writer, sheet_name = self.main_sheet)
+        writer.save()
+        wb = load_workbook(self.workbook_path)
+        #sheet = wb.get_sheet_by_name(self.main_sheet)
+        sheet = wb[self.main_sheet]
+        tab = Table(displayName = "Database_Outline", ref = self.colnum_string(db.shape[1] + 1, db.shape[0]))
+        style = TableStyleInfo(name = "TableStyleMedium9", showRowStripes = True, showColumnStripes = False)
+        tab.tableStyleInfo = style
+        sheet.add_table(tab)
+        wb.save(self.workbook_path)
+        
+    ##-------------------Execution_Functions------------------------##
+    
+    def fetch_main(self):
+        data = pd.read_excel(self.workbook_path,self.main_sheet)
+        data = data[data.INCLUDE == "Y"]
+        return data
+    
+    def fetch_general_table(self):
+        data = pd.DataFrame(columns = self.final_table)
+        select_table = self.fetch_main()
+        data['TABLE_NAME'] = select_table['TABLE_NAME']
+        data['COLUMN_NAME'] = select_table['COLUMN_NAME']
+        data['DATA_TYPE'] = select_table['DATA_TYPE']
+        return data
+    
+    def gen_analytics(self):
+        data = self.fetch_general_table()
+        date_cols = ['YRS_25','PERCENT_GTR_25','YRS_50','PERCENT_GTR_50','YRS_75',
+                      'PERCENT_GTR_75','YRS_100','PERCENT_GTR_100',
+                      'YRS_150','PERCENT_GTR_150']
+        for index, row in data.iterrows():
+            if index % 500 == 0:
+                print('General Iteration: ' + str(index))
+#             Remember that this breaks the code ---------#
+#             if index == 500:
+#                 break
+#             Remember to Remove -------------------------#
+            data.at[index,'NULL_COUNT'], data.at[index,'PERCENTAGE_NULL'] = self.count_nulls(row['TABLE_NAME'],row['COLUMN_NAME'])
+            data.at[index,'BLANK_COUNT'], data.at[index,'PERCENTAGE_BLANK'] = self.count_blanks(row['TABLE_NAME'],row['COLUMN_NAME']) 
+            data.at[index,'MAX_LENGTH'], data.at[index,'ACTUAL_MAX_LENGTH'] = self.comp_length(row['TABLE_NAME'],row['COLUMN_NAME'])                
+            data.at[index,'UNIQUE_COLUMN'], data.at[index,'TABLE_COUNT'] = self.check_unique(row['TABLE_NAME'],row['COLUMN_NAME'])                
+            data.at[index,'COUNT_TRAILING'], data.at[index,'PERCENT_TRAILING'] = self.count_trailing(row['TABLE_NAME'],row['COLUMN_NAME'])
+            data.at[index,'COUNT_LEADING'], data.at[index,'PERCENT_LEADING'] = self.count_leading(row['TABLE_NAME'], row['COLUMN_NAME'])
+            data.at[index,'HASH_SUM'] = self.hash_sum(row['TABLE_NAME'], row['COLUMN_NAME'])
+            
+            if row['DATA_TYPE'].lower() == 'int' or row['DATA_TYPE'].lower() == 'numeric' or row['DATA_TYPE'].lower() == 'float' or row['DATA_TYPE'].lower() == 'tinyint':
+                data.at[index,'NEGATIVE_COUNT'], data.at[index,'PERCENTAGE_NEGATIVE'] = self.count_neg(row['TABLE_NAME'],row['COLUMN_NAME'])
+                data.at[index,'ZERO_COUNT'], data.at[index,'PERCENTAGE_ZERO'] = self.count_zero(row['TABLE_NAME'],row['COLUMN_NAME'])
+                data.at[index,'MEAN_VALUE'] = self.find_mean(row['TABLE_NAME'], row['COLUMN_NAME'])
+#                 data.at[index,'MEDIAN_VALUE'] = self.find_median(row['TABLE_NAME'], row['COLUMN_NAME'])
+                data.at[index,'MODE_VALUE'] = self.find_mode(row['TABLE_NAME'], row['COLUMN_NAME'])
+                data.at[index,'MAX_VALUE'] = self.find_max(row['TABLE_NAME'], row['COLUMN_NAME'])
+                data.at[index,'MIN_VALUE'] = self.find_min(row['TABLE_NAME'], row['COLUMN_NAME'])
+                
+            #elif row['DATA_TYPE'].lower() == 'varchar':    
+            elif row['DATA_TYPE'].lower() == 'datetime' or row['DATA_TYPE'].lower() == 'datetime2' or row['DATA_TYPE'].lower() == 'date':
+                data.at[index,'MIN_DATE'], data.at[index,'MAX_DATE'] = self.date_range(row['TABLE_NAME'],row['COLUMN_NAME'])
+                data.at[index,'FUTURE_DATE_COUNT'], data.at[index,'PERCENTAGE_FUTURE_DATE'] = self.count_future_date(row['TABLE_NAME'],row['COLUMN_NAME'])
+                data.at[index,'ABNORMAL_DATE_COUNT'] = self.abnormal_date_count(row['TABLE_NAME'],row['COLUMN_NAME'])
+                count_old_date = self.count_old_date(row['TABLE_NAME'],row['COLUMN_NAME'])
+                for i in range(len(count_old_date)):
+                    data.at[index,date_cols[i]] = float(count_old_date[i])
+        return data
+    
+    def out_analytics(self, num_rank = 10):
+        data = pd.DataFrame(columns = self.outlier_table)
+        columns = self.fetch_main()
+        for index, row in columns.iterrows():
+            if index % 500 == 0:
+                print('Outlier Iteration: ' + str(index))
+            #Remember that this breaks the code ---------#
+#             if index == 500:
+#                 break
+            #Remember to Remove -------------------------#
+            temp = pd.DataFrame(columns = ['TABLE_NAME','COLUMN_NAME','DATA_TYPE'])
+            AFL = self.abnormal_frequency_list(row['TABLE_NAME'],row['COLUMN_NAME'], num_rank)
+            STRUCTURE = self.column_format_check(row['TABLE_NAME'],row['COLUMN_NAME'],num_rank)
+            if row['DATA_TYPE'].lower() == 'int' or row['DATA_TYPE'].lower() == 'numeric' or row['DATA_TYPE'].lower() == 'float' or row['DATA_TYPE'].lower() == 'tinyint':
+                AVL = self.abnormal_values_list(row['TABLE_NAME'],row['COLUMN_NAME'])
+                table = pd.concat([temp,AVL,AFL,STRUCTURE],axis = 1, sort = False)
+            elif row['DATA_TYPE'].lower() == 'datetime' or row['DATA_TYPE'].lower() == 'datetime2' or row['DATA_TYPE'].lower() == 'date' :
+                DF = self.date_frequency(row['TABLE_NAME'],row['COLUMN_NAME'], num_rank)
+                MF = self.month_frequency(row['TABLE_NAME'],row['COLUMN_NAME'], num_rank)
+                YF = self.year_frequency(row['TABLE_NAME'],row['COLUMN_NAME'], num_rank)
+                table = pd.concat([temp,DF,MF,YF,AFL,STRUCTURE],axis = 1, sort = False)
+            else:
+                table = pd.concat([temp,AFL,STRUCTURE],axis = 1, sort = False)
+            #table['TABLE_NAME'] = None
+            #table['COLUMN_NAME'] = None
+            #table['DATA_TYPE'] = None
+            table['TABLE_NAME'] = row['TABLE_NAME']
+            table['COLUMN_NAME'] = row['COLUMN_NAME']
+            table['DATA_TYPE'] = row['DATA_TYPE']
+            data = pd.concat([data,table], axis = 0, sort = False)
+        return data
+    
+    def write_from_gen(self):
+        data = self.gen_analytics()
+        data.index.name = "INDEX"
+        with pd.ExcelWriter(self.workbook_path, engine = 'openpyxl') as writer:
+            writer.book = load_workbook(self.workbook_path)
+            data.to_excel(writer, self.analytics_sheet)
+        writer.save()
+        wb = load_workbook(self.workbook_path)
+        #sheet = wb.get_sheet_by_name(self.analytics_sheet)
+        sheet = wb[self.analytics_sheet]
+        tab = Table(displayName = "Analytics_Table", ref = self.colnum_string(data.shape[1] + 1, data.shape[0]))
+        style = TableStyleInfo(name = "TableStyleMedium9", showRowStripes = True, showColumnStripes = False)
+        tab.tableStyleInfo = style
+        sheet.add_table(tab)
+        wb.save(self.workbook_path)
+        return data
+    
+    ##Write the outlier analysis function here##
+    def write_from_out(self, num_rank = 10):
+        data = self.out_analytics(num_rank)
+        data.index.name = "INDEX"
+        with pd.ExcelWriter(self.workbook_path, engine = 'openpyxl') as writer:
+            writer.book = load_workbook(self.workbook_path)
+            data.to_excel(writer, self.outlier_sheet)
+        writer.save()
+        wb = load_workbook(self.workbook_path)
+        #sheet = wb.get_sheet_by_name(self.outlier_sheet)
+        sheet = wb[self.outlier_sheet]
+        tab = Table(displayName = "Outlier_Table", ref = self.colnum_string(data.shape[1] + 1, data.shape[0]))
+        style = TableStyleInfo(name = "TableStyleMedium9", showRowStripes = True, showColumnStripes = False)
+        tab.tableStyleInfo = style
+        sheet.add_table(tab)
+        wb.save(self.workbook_path)
+        return data 
+    
+    ##-------------------General_SQL_Functions--------------------##
+    
+    def check_unique(self,Table,Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT COUNT(*) AS 'UNIQUE_COUNT_OF_COLUMN',
+                        (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {}) AS 'TABLE_COUNT' 
+                    FROM(
+                        SELECT DISTINCT {}
+                        FROM {} WHERE {} IS NOT NULL AND BATCH_ID = {}
+                        ) X;""".format(tab,batch_id,Column,tab,Column, batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], results[0][1]
+        except:
+            return 0,0
+
+    
+    def count_nulls(self,Table,Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_COUNT_OF_NULLS,
+                        (CAST(TOTAL_COUNT_OF_NULLS AS NUMERIC(15,2)) / 
+                        (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_NULLS'
+                    FROM(
+                        SELECT COUNT(*) AS 'TOTAL_COUNT_OF_NULLS'
+                        FROM {}
+                        WHERE {} IS NULL
+                        AND BATCH_ID = {}
+                        ) SUB ; """.format(tab,batch_id,tab,Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+
+#Change Blank Query to what was discussed:
+#WHERE CAST({} AS VARCHAR(255))=''
+
+    def count_blanks(self,Table,Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_COUNT_OF_BLANKS,
+                        (CAST(TOTAL_COUNT_OF_BLANKS AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_BLANKS'
+                    FROM(
+                        SELECT COUNT(*) AS 'TOTAL_COUNT_OF_BLANKS'
+                        FROM {}
+                        WHERE CAST({} AS VARCHAR(255)) = ''
+                        AND BATCH_ID = {}
+                        ) SUB ;""".format(tab,batch_id,tab,Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+    
+    def date_range(self,Table,Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT MIN({}) AS 'MINIMUM_DATE',
+                            MAX({}) AS 'MAXIMUM_DATE'
+                    FROM {} WHERE BATCH_ID = {}""".format(Column, Column, tab,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], results[0][1]
+        except:
+            return 0,0
+    
+    def count_future_date(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_COUNT_OF_FUTUREDATE,
+                        (CAST(TOTAL_COUNT_OF_FUTUREDATE AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_FUTUREDATE'
+                    FROM (
+                        SELECT COUNT(*) AS 'TOTAL_COUNT_OF_FUTUREDATE'
+                        FROM {}
+                        WHERE {} > GETDATE()
+                        AND BATCH_ID = {}
+                        ) SUB ;""".format(tab,batch_id,tab,Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+    
+    def count_old_date(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT YRS_25,
+                        (CAST(YRS_25 AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_GTR_THAN_25',
+                        YRS_50,
+                        (CAST(YRS_50 AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_GTR_THAN_50',
+                        YRS_75,
+                        (CAST(YRS_75 AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_GTR_THAN_75',
+                        YRS_100,
+                        (CAST(YRS_100 AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_GTR_THAN_100',
+                        YRS_150,
+                        (CAST(YRS_150 AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_GTR_THAN_150'
+                    FROM(
+                        SELECT COUNT(CASE WHEN YEARS >= 25 THEN 1 ELSE NULL END) AS 'YRS_25',
+                        COUNT(CASE WHEN YEARS >= 50 THEN 1 ELSE NULL END) AS 'YRS_50',
+                        COUNT(CASE WHEN YEARS >= 75 THEN 1 ELSE NULL END) AS 'YRS_75',
+                        COUNT(CASE WHEN YEARS >= 100 THEN 1 ELSE NULL END) AS 'YRS_100',
+                        COUNT(CASE WHEN YEARS >= 150 THEN 1 ELSE NULL END) AS 'YRS_150'
+                        FROM (
+                            SELECT (CAST(DATEDIFF(DAY,{}, GETDATE()) AS NUMERIC(15,2))/365) AS 'YEARS'
+                            FROM {}
+                            WHERE BATCH_ID = {}
+                            )X
+                            )Y""".format(tab,batch_id,tab,batch_id,tab,batch_id,tab,batch_id,tab,batch_id,Column,tab,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0]
+        except:
+            return [0]*10
+
+       
+
+    def abnormal_date_count(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT COUNT(*)
+                    FROM {}
+                    WHERE BATCH_ID = {}
+                    AND ({} LIKE '%9999%'
+                    OR {} LIKE '%-99%')""".format(tab,batch_id,Column, Column)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0]
+        except:
+            return 0
+    
+    def count_neg(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_COUNT_OF_NEGS,
+                        (CAST(TOTAL_COUNT_OF_NEGS AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_NEGS'
+                    FROM(
+                        SELECT COUNT(*) AS 'TOTAL_COUNT_OF_NEGS'
+                        FROM {}
+                        WHERE CAST({} AS NUMERIC(15,2)) < 0
+                        AND BATCH_ID = {}
+                        ) SUB ;""".format(tab,batch_id, tab, Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+    
+    def count_zero(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_COUNT_OF_ZERO,
+                        (CAST(TOTAL_COUNT_OF_ZERO AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_OF_ZERO'
+                    FROM(
+                        SELECT COUNT(*) AS 'TOTAL_COUNT_OF_ZERO'
+                        FROM {}
+                        WHERE CAST({} AS NUMERIC(15,2)) = 0
+                        AND BATCH_ID = {}
+                        ) SUB ;""".format(tab,batch_id,tab,Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+
+    def comp_length(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT MAX(LEN({})) AS 'ACTUAL_MAX_LENGTH',
+                        (
+                        SELECT CHARACTER_MAXIMUM_LENGTH
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_CATALOG = '{}'
+                        AND TABLE_NAME = '{}'
+                        AND COLUMN_NAME = '{}'
+                        ) AS 'COLUMN_MAX_LENGTH'
+                    FROM {} WHERE BATCH_ID = {}""".format(Column,self.database,Table,Column,tab,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], results[0][1]
+        except:
+            return 0,0
+    
+    def count_trailing(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_TRAILING_COUNT,
+                        (CAST(TOTAL_TRAILING_COUNT AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_TRAILING'
+                    FROM(
+                        SELECT COUNT(*) AS 'TOTAL_TRAILING_COUNT'
+                        FROM {}
+                        WHERE {} LIKE '% '
+                        AND BATCH_ID = {}
+                        ) SUB ;""".format(tab,batch_id, tab, Column,batch_id)
+        
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+    
+    def count_leading(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOTAL_TRAILING_COUNT,
+                        (CAST(TOTAL_TRAILING_COUNT AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {})) * 100 AS 'PERCENT_TRAILING'
+                    FROM(
+                        SELECT COUNT(*) AS 'TOTAL_TRAILING_COUNT'
+                        FROM {}
+                        WHERE {} LIKE ' %'
+                        AND BATCH_ID = {}
+                        ) SUB ;""".format(tab,batch_id, tab, Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return results[0][0], float(results[0][1])
+        except:
+            return 0,0
+    
+    def find_mean(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT AVG({}) AS 'MEAN_VALUE'
+                    FROM {}
+                    WHERE {} is NOT NULL
+                    AND BATCH_ID = {}
+                """.format(Column, tab, Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return float(results[0][0])
+        except:
+            return 0
+    
+#     def find_median(self, Table, Column):
+#         tab = '.'.join([self.database, self.schema,Table])
+#         query = """SELECT TOP 1 (*) 
+#                     FROM (SELECT PERCENTILE_DISC(0.5) 
+#                         WITHIN GROUP (ORDER BY {}) OVER() AS 'MEDIAN'
+#                         FROM {})x;
+#                 """.format(Column, tab)
+#         try:
+#             self.cursor.execute(query)
+#             results = self.cursor.fetchall()
+#             return float(results[0][0])
+#         except:
+#             return 'NaN'
+
+    def hash_sum(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT SUM(CAST(ABS(CHECKSUM({})) AS BIGINT)) FROM {} WHERE BATCH_ID = {}""".format(Column, tab,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return float(results[0][0])
+        except:
+            return 0
+    
+    def find_mode(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOP 1 with ties {} AS 'MODE_VALUE'
+                    FROM {}
+                    WHERE {} IS Not NULL
+                    AND BATCH_ID = {}
+                    GROUP BY {}
+                    ORDER BY COUNT(*) DESC
+                """.format(Column, tab, Column, batch_id,Column)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return float(results[0][0])
+        except:
+            return 0
+    
+    def find_min(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT MIN({}) AS MIN_VALUE
+                    FROM {}
+                    WHERE {} IS Not NULL
+                    AND BATCH_ID = {}
+                    """.format(Column, tab, Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return float(results[0][0])
+        except:
+            return 0
+    
+    def find_max(self, Table, Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT MAX({}) AS MAX_VALUE
+                    FROM {}
+                    WHERE {} IS Not NULL
+                    AND BATCH_ID = {}
+                    """.format(Column, tab, Column,batch_id)
+        try:
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+            return float(results[0][0])
+        except:
+            return 0
+    
+
+###-----------------------OUTLIER_SQL_QUERIES------------------------###
+    
+    def date_frequency(self,Table,Column,N):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOP {} {} AS 'DF_DATE',
+                        COUNT(*) AS 'DF_COUNT',
+                        ((CAST(COUNT(*) AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {}))*100) AS 'DF_PERCENT'
+                    FROM {}
+                    WHERE BATCH_ID = {}
+                    GROUP BY {}
+                    ORDER BY COUNT(*) DESC""".format(N, Column, tab, batch_id,tab,batch_id, Column)
+        try:
+            results = pd.read_sql(query,self.connection)
+            return results
+        except:
+            return pd.DataFrame(data = {'DF_DATE':['ERROR'],'DF_COUNT':['ERROR'],'DF_PERCENT':['ERROR']})
+    
+    def month_frequency(self,Table,Column,N):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOP {} MONTH({}) AS 'MF_MONTH',
+                        YEAR({}) AS 'MF_YEAR',
+                        COUNT(*) AS 'MF_COUNT',
+                        ((CAST(COUNT(*) AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {}))*100) AS 'MF_PERCENT'
+                    FROM {}
+                    WHERE BATCH_ID = {}
+                    GROUP BY MONTH({}), YEAR({})
+                    ORDER BY COUNT(*) DESC""".format(N, Column, Column, tab,batch_id, tab,batch_id, Column, Column)
+        try:
+            results = pd.read_sql(query, self.connection)
+            return results
+        except:
+            return pd.DataFrame(data = {'MF_MONTH':['ERROR'],'MF_COUNT':['ERROR'],'MF_PERCENT':['ERROR']})
+    
+    def year_frequency(self,Table,Column,N):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOP {} YEAR({}) AS 'YF_YEAR',
+                        COUNT(*) AS 'YF_COUNT',
+                        ((CAST(COUNT(*) AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {}))*100) AS 'YF_PERCENT'
+                    FROM {}
+                    WHERE BATCH_ID = {}
+                    GROUP BY YEAR({})
+                    ORDER BY COUNT(*) DESC""".format(N, Column, tab,batch_id, tab,batch_id, Column)
+        try:
+            results = pd.read_sql(query, self.connection)
+            return results
+        except:
+            return pd.DataFrame(data = {'YF_YEAR':['ERROR'],'YF_COUNT':['ERROR'],'YF_PERCENT':['ERROR']})
+    
+    def abnormal_values_list(self,Table,Column):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT {} AS 'AVL_VALUE',
+                        ({} - AVERAGE) / NULLIF(STDDEV, 0) AS 'AVL_ZSCORE'
+                    FROM(
+                        SELECT {},
+                            (SELECT AVG({}) FROM {} WHERE BATCH_ID = {}) AS 'AVERAGE',
+                            (SELECT STDEV({}) FROM {} WHERE BATCH_ID = {}) AS 'STDDEV'
+                        FROM {} WHERE BATCH_ID = {} T
+                        ) X
+                    WHERE ({} - AVERAGE) / NULLIF(STDDEV, 0) > 3
+                    ORDER BY ABS(({} - AVERAGE) / NULLIF(STDDEV, 0)) DESC;
+                    """.format(Column, Column, Column, Column, tab,batch_id, Column, tab,batch_id, tab,batch_id, Column, Column)
+        try:
+            results = pd.read_sql(query, self.connection)
+            return results
+        except:
+            return pd.DataFrame(data = {'AVL_VALUE':['ERROR'],'AVL_ZSCORE':['ERROR']})
+
+    def abnormal_frequency_list(self,Table,Column,N):
+        tab = '.'.join([self.database,Table])
+        query = """SELECT TOP {} {} AS 'AFL_VALUE',
+                        COUNT(*) AS 'AFL_COUNT',
+                        ((CAST(COUNT(*) AS NUMERIC(15,2)) / (SELECT COUNT(*) FROM {} WHERE BATCH_ID = {}))*100) AS 'AFL_PERCENT'
+                    FROM {} WHERE BATCH_ID = {}
+                    GROUP BY {}
+                    ORDER BY COUNT(*) DESC;
+                    """.format(N, Column, tab,batch_id, tab, batch_id,Column)
+        try:
+            results = pd.read_sql(query, self.connection)
+            return results
+        except:
+            return pd.DataFrame(data = {'AFL_VALUE':['ERROR'],'AFL_COUNT':['ERROR'],'AFL_PERCENT':['ERROR']})
+    
+###---------------------Formatting_of_Col----------------------###
+    def column_format_check(self, Table, Column, num_rank):
+        tab = '.'.join([self.database,Table])
+        query =  """SELECT {} AS COUNT_STRUCTURE
+                    FROM {} WHERE BATCH_ID = {}
+                    """.format(Column, tab, batch_id)
+        try:
+            results = pd.read_sql(query, self.connection)
+            results['COUNT_STRUCTURE'] = results['COUNT_STRUCTURE'].astype(str)
+            results['COUNT_STRUCTURE'] = results['COUNT_STRUCTURE'].str.replace("[a-zA-Z0-9]", 'X')
+            fin = results.COUNT_STRUCTURE.value_counts()
+            fin_d = pd.DataFrame(fin)
+            fin_d.index.name = 'STRUCTURE'
+            fin_d = fin_d.reset_index()
+            return fin_d.iloc[:num_rank,]
+        except:
+            return pd.DataFrame(data = {'STRUCTURE':['ERROR'],'COUNT_STRUCTURE':['ERROR']})
+
+#Part 1
+## Pass the server and database variables
+server = "???"
+database = 'FCC'
+
+## Pass the file path where the file should be created
+file = r'\\wab-fspw02\office\WAL BSA-AML Task Force\Western Alliance Bank BSA-AML\FCC_Analytics\CTR\DQ\Gen_Analytics\CTR_UDM_STG.xlsx'
+
+
+db_inter = DatabaseInterface(server, database, file)
+db_inter.create_excel()
+
+#Part 2
+
+## Pass the DB HOP server and database variables
+server = "???-??"
+database = '???'
+db_inter = DatabaseInterface(server, database, file)
+
+db_inter.create_processed_sheet()
+db_inter.write_from_gen()
+# db_inter.write_from_out(num_rank = 3)
+
+
+todays_date = datetime.now()
+today = todays_date # if this results in error, comment this line and uncomment the line 2 lines below
+todays_date = str(todays_date)
+# today = todays_date
+todays_date = todays_date.replace(":", ".")
+new_filename = r'\????' + str(batch_id) + '_' + str(todays_date) + '.xlsx'
+os.rename(r'\\???.xlsx', new_filename)
+
+
+##File check for new renamed file
+try:
+    f = open(new_filename)
+    f.close()
+    existing_file = 0
+except FileNotFoundError:
+    print('Renamed file does not exist')
+    existing_file = 1
+
+
+connection = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=????;'
+    'Database=???;'
+    'Trusted_Connection=yes'
+)
+
+## CTR - ODS STG
+## CTR - ODS TFM
+## CTR - UDM STG
+database = 'CTR - UDM STG' 
+#todayDate = """SELECT CAST(GETDATE() AS DATE)"""
+#today = pd.read_sql_query(todayDate, connection)
+#today = today.iloc[0][0]
+
+
+import xlrd
+
+book = xlrd.open_workbook(new_filename)
+sheet = book.sheet_by_name("General_Analytics")
+# sheet = book.sheet_by_index(0)
+
+cursor = connection.cursor()
+
+
+
+insertQuery = """INSERT INTO [???\????].[GEN_ANALYTICS] ([INDEX],TABLE_NAME,COLUMN_NAME,DATA_TYPE,UNIQUE_COLUMN,TABLE_COUNT,NULL_COUNT,PERCENTAGE_NULL,BLANK_COUNT,PERCENTAGE_BLANK,MIN_DATE,MAX_DATE,FUTURE_DATE_COUNT,PERCENTAGE_FUTURE_DATE,ABNORMAL_DATE_COUNT,YRS_25,PERCENT_GTR_25,YRS_50,PERCENT_GTR_50,YRS_75,PERCENT_GTR_75,YRS_100,PERCENT_GTR_100,YRS_150,PERCENT_GTR_150,NEGATIVE_COUNT,PERCENTAGE_NEGATIVE,ZERO_COUNT,PERCENTAGE_ZERO,MAX_LENGTH,ACTUAL_MAX_LENGTH,COUNT_TRAILING,PERCENT_TRAILING,COUNT_LEADING,PERCENT_LEADING,MEAN_VALUE,MODE_VALUE,MAX_VALUE,MIN_VALUE,HASH_SUM,BATCH_ID,RUN_DATE,DB_HOP) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,""" + """'""" + str(batch_id) + """'""" +""","""+ """'""" + str(today) + """'""" +""",""" + """'""" + str(database) + """'"""+""")"""
+
+for r in range(1,sheet.nrows):
+        index = sheet.cell(r,0).value
+        table_name = sheet.cell(r,1).value
+        column_name = sheet.cell(r,2).value
+        data_type = sheet.cell(r,3).value
+        unique_column = sheet.cell(r,4).value
+        table_count = sheet.cell(r,5).value
+        null_count = sheet.cell(r,6).value
+        percentage_null = sheet.cell(r,7).value
+        blank_count = sheet.cell(r,8).value
+        percentage_blank = sheet.cell(r,9).value
+        min_date = sheet.cell(r,10).value
+        max_date = sheet.cell(r,11).value
+        future_date_count = sheet.cell(r,12).value
+        percentage_future_date = sheet.cell(r,13).value
+        abnormal_date_count = sheet.cell(r,14).value
+        yrs_25 = sheet.cell(r,15).value
+        percent_gtr_25 = sheet.cell(r,16).value
+        yrs_50 = sheet.cell(r,17).value
+        percent_gtr_50 = sheet.cell(r,18).value
+        yrs_75 = sheet.cell(r,19).value
+        percent_gtr_75 = sheet.cell(r,20).value
+        yrs_100 = sheet.cell(r,21).value
+        percent_gtr_100 = sheet.cell(r,22).value
+        yrs_150 = sheet.cell(r,23).value
+        percent_gtr_150 = sheet.cell(r,24).value
+        negative_count = sheet.cell(r,25).value
+        percentage_negative = sheet.cell(r,26).value
+        zero_count = sheet.cell(r,27).value
+        percentage_zero = sheet.cell(r,28).value
+        max_length = sheet.cell(r,29).value
+        actual_max_length = sheet.cell(r,30).value
+        count_trailing = sheet.cell(r,31).value
+        percent_trailing = sheet.cell(r,32).value
+        count_leading = sheet.cell(r,33).value
+        percent_leading = sheet.cell(r,34).value
+        mean_value = sheet.cell(r,35).value
+        mode_value = sheet.cell(r,36).value
+        max_value = sheet.cell(r,37).value
+        min_value = sheet.cell(r,38).value
+        hash_sum = sheet.cell(r,39).value
+
+        values = (index,table_name,column_name,data_type,unique_column,table_count,null_count,percentage_null,blank_count,percentage_blank,min_date,max_date,future_date_count,percentage_future_date,abnormal_date_count,yrs_25,percent_gtr_25,yrs_50,percent_gtr_50,yrs_75,percent_gtr_75,yrs_100,percent_gtr_100,yrs_150,percent_gtr_150,negative_count,percentage_negative,zero_count,percentage_zero,max_length,actual_max_length,count_trailing,percent_trailing,count_leading,percent_leading,mean_value,mode_value,max_value,min_value,hash_sum)
+
+        cursor.execute(insertQuery,values)
+    
+cursor.close()
+connection.commit()
+connection.close()
+
+
+    
+## Check if GEN_ANALYTICS table populated
+
+conn_batch = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=????;'
+    'Database=FCC;'
+    'Trusted_Connection=yes'
+)
+
+batch_count_query = """SELECT COUNT(*) FROM [???].[???\???].[GEN_ANALYTICS] WHERE [DB_HOP] = 'CTR - UDM STG' AND BATCH_ID = '""" + str(batch_id) + """'"""
+batch_count = pd.read_sql_query(batch_count_query, conn_batch)
+batch_count = batch_count.iloc[0][0]
+
+    
+database = '???'
+
+## Establish Connection to Databases
+conn = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=???;'
+    'Database=???;'
+    'Trusted_Connection=yes'
+)
+cursor = conn.cursor()
+
+conn2 = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=????;'
+    'Database=FCC;'
+    'Trusted_Connection=yes'
+)
+cursor2 = conn2.cursor()
+
+
+## Insert into DQ Database Table
+pk_inp = pd.read_excel (r'\\???.xlsx') ## this file will always remain the same as long as no new entities are added
+pk_inp['DQ_COMPK_CNT'] = 0
+pk_inp['DB_HOP'] = str(database)
+pk_inp['RUN_DATE'] = str(today)
+pk_inp['BATCH_ID'] = str(batch_id)
+
+
+for name in range(0,len(pk_inp['TABLE_NAME'])):
+    pk_cnt = pd.read_sql_query("SELECT COUNT(*) AS DQ_COMPK_CNT FROM (SELECT DISTINCT " + pk_inp['COLUMN_NAME'][name] + " FROM " + pk_inp['TABLE_NAME'][name] + " WHERE BATCH_ID = '" + batch_id + "')SUB",conn)    
+#     pk_cnt = pd.read_sql_query("SELECT DISTINCT " + inp['COLUMN_NAME'][name] + " FROM " + inp['TABLE_NAME'][name] + " WHERE BATCH_ID = (?)", conn, params = batch_id)    
+    pk_inp['DQ_COMPK_CNT'][name] = pk_cnt.iloc[0][0]
+    
+    
+for index,row in pk_inp.iterrows():
+    cursor2.execute("INSERT INTO [dbo].[DQ_PK_OUTPUT]([TABLE_NAME],[COLUMN_NAME],[DQ_COMPK_CNT],[DB_HOP],[RUN_DATE],[BATCH_ID]) VALUES (?,?,?,?,?,?)", row['TABLE_NAME'], row['COLUMN_NAME'], row['DQ_COMPK_CNT'], row['DB_HOP'], row['RUN_DATE'], row['BATCH_ID']) 
+    conn2.commit()
+    
+
+## Verify the DQ_PK_OUTPUT batch row count has not changed
+
+conn_batch = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=???;'
+    'Database=???;'
+    'Trusted_Connection=yes'
+)
+
+batch_count_query = """SELECT COUNT(*) FROM [FCC].[dbo].[DQ_PK_OUTPUT] WHERE [DB_HOP] = 'CTR - UDM STG' AND BATCH_ID = '""" + str(batch_id) + """'"""
+batch_count = pd.read_sql_query(batch_count_query, conn_batch)
+batch_count = batch_count.iloc[0][0]
+
+ref_inp = pd.read_excel (r'\\???\DQ\Gen_Analytics\DQ_ACTIMIZE_REF_INTEGRITY_UDM.xlsx') ## this file will always remain the same as long as no new entities are added
+ref_inp['DQ_REFER_CNT'] = 0
+ref_inp['DB_HOP'] = str(database)
+ref_inp['RUN_DATE'] = str(today)
+ref_inp['BATCH_ID'] = str(batch_id)
+
+for name in range(0,len(ref_inp['TABLE_NAME'])):
+    ref_cnt = pd.read_sql_query("SELECT COUNT(" + ref_inp['COLUMN_NAME'][name] + ") AS DQ_REFER_CNT FROM "  + ref_inp['TABLE_NAME'][name] + " WHERE BATCH_ID = '" + batch_id + "' AND " + ref_inp['COLUMN_NAME'][name] + " NOT IN (SELECT "  + ref_inp['REF_COLUMN'][name] + " FROM "  + ref_inp['REF_TABLE'][name] + ") AND CAST(" + ref_inp['COLUMN_NAME'][name] + " AS VARCHAR(100)) <> ''", conn)
+    ref_inp['DQ_REFER_CNT'][name] = ref_cnt.iloc[0][0]
+    
+for index,row in ref_inp.iterrows():
+    cursor2.execute("INSERT INTO [dbo].[DQ_REF_OUTPUT]([TABLE_NAME],[COLUMN_NAME],[DQ_REFER_CNT],[DB_HOP],[RUN_DATE],[BATCH_ID]) VALUES (?,?,?,?,?,?)", row['TABLE_NAME'], row['COLUMN_NAME'], row['DQ_REFER_CNT'], row['DB_HOP'], row['RUN_DATE'], row['BATCH_ID']) 
+    conn2.commit()
+    
+ref2_inp = pd.read_excel (r'\\??\DQ\Gen_Analytics\DQ_ACTIMIZE_REF_INTEGRITY_ADDITIONAL_UDM.xlsx') ## this file will always remain the same as long as no new entities are added
+ref2_inp['DQ_REFER_CNT'] = 0
+ref2_inp['DB_HOP'] = str(database)
+ref2_inp['RUN_DATE'] = str(today)
+ref2_inp['BATCH_ID'] = str(batch_id)
+
+for name in range(0,len(ref2_inp['TABLE_NAME'])):
+    ref2_cnt = pd.read_sql_query("SELECT (SELECT COUNT(" + ref2_inp['COLUMN_NAME'][name] + ") AS DQ_REFER_CNT FROM " +  ref2_inp['TABLE_NAME'][name] + " WHERE BATCH_ID = '" + batch_id+ "' AND  ENTITY_TYPE_CD = 'PARTY' AND " + ref2_inp['COLUMN_NAME'][name] + " NOT IN (SELECT PARTY_KEY FROM AML_UDM_STG.PARTY WHERE BATCH_ID = '" + batch_id + "')) + (SELECT COUNT(" + ref2_inp['COLUMN_NAME'][name] + ") AS DQ_REFER_CNT FROM " +  ref2_inp['TABLE_NAME'][name] + " WHERE BATCH_ID = '" + batch_id+ "' AND  ENTITY_TYPE_CD = 'ACCOUNT' AND " + ref2_inp['COLUMN_NAME'][name] + " NOT IN (SELECT ACCOUNT_KEY FROM AML_UDM_STG.ACCOUNT WHERE BATCH_ID = '" + batch_id + "')) + (SELECT COUNT(" + ref2_inp['COLUMN_NAME'][name] + ") AS DQ_REFER_CNT FROM " +  ref2_inp['TABLE_NAME'][name] + " WHERE BATCH_ID = '" + batch_id+ "' AND  ENTITY_TYPE_CD = 'BRANCH' AND " + ref2_inp['COLUMN_NAME'][name] + " NOT IN (SELECT BRANCH_KEY FROM AML_UDM_STG.BRANCH WHERE BATCH_ID = '" + batch_id + "')) + (SELECT COUNT(" + ref2_inp['COLUMN_NAME'][name] + ") AS DQ_REFER_CNT FROM " +  ref2_inp['TABLE_NAME'][name] + " WHERE BATCH_ID = '" + batch_id+ "' AND  ENTITY_TYPE_CD = 'ORGANIZATION' AND " + ref2_inp['COLUMN_NAME'][name] + " NOT IN (SELECT ORGANIZATION_KEY FROM AML_UDM_STG.ORGANIZATION WHERE BATCH_ID = '" + batch_id + "'))", conn)
+    ref2_inp['DQ_REFER_CNT'][name] = ref2_cnt.iloc[0][0]
+    
+for index,row in ref2_inp.iterrows():
+    cursor2.execute("INSERT INTO [dbo].[DQ_REF_OUTPUT]([TABLE_NAME],[COLUMN_NAME],[DQ_REFER_CNT],[DB_HOP],[RUN_DATE],[BATCH_ID]) VALUES (?,?,?,?,?,?)", row['TABLE_NAME'], row['COLUMN_NAME'], row['DQ_REFER_CNT'], row['DB_HOP'], row['RUN_DATE'], row['BATCH_ID']) 
+    conn2.commit()
+
+    
+cursor2.close()
+conn2.close()
+cursor.close()
+conn.close()    
+    
+
+## Verify the GEN_ANALYTICS batch row count has not changed
+
+conn_batch = pyodbc.connect(
+    'Driver={ODBC Driver 17 for SQL Server};'
+    'Server=???;'
+    'Database=???;'
+    'Trusted_Connection=yes'
+)
+
+batch_count_query = """SELECT COUNT(*) FROM ???? WHERE [DB_HOP] = 'CTR - UDM STG' AND BATCH_ID = '""" + str(batch_id) + """'"""
+batch_count = pd.read_sql_query(batch_count_query, conn_batch)
+batch_count = batch_count.iloc[0][0]
+
+print(datetime.now() - begin_time)
+
+
+# In[12]:
+
+
+
+
