@@ -720,7 +720,7 @@ server = "???"
 database = 'FCC'
 
 ## Pass the file path where the file should be created
-file = r'\\wab-fspw02\office\WAL BSA-AML Task Force\Western Alliance Bank BSA-AML\FCC_Analytics\CTR\DQ\Gen_Analytics\CTR_UDM_STG.xlsx'
+file = r'\\??.xlsx'
 
 
 db_inter = DatabaseInterface(server, database, file)
